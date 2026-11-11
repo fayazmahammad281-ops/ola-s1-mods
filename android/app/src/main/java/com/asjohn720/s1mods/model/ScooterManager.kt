@@ -166,7 +166,7 @@ class ScooterManager(private val context: Context) {
     suspend fun testConnection(ip: String = scooterIp.value, scope: Int? = scooterScope.value): Boolean = withContext(Dispatchers.IO) {
         log("[*] Testing port 50005 on $ip...")
         val open = NetworkScanner.testPort(ip, 50005, scope, 1000)
-        isConnected.value = open
+        // This checks TCP reachability only. It must not set the gRPC connection state.
         if (open) {
             log("[+] Port 50005 is OPEN and responsive!")
         } else {
