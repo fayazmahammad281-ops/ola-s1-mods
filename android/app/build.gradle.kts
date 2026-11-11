@@ -11,17 +11,17 @@ android {
         }
     }
 
-    defaultConfig {
-        applicationId = "com.asjohn720.s1mods"
+        defaultConfig {
+        applicationId = "com.fayazmahammad281.s1mods.moveos403"
         minSdk = 26
         targetSdk = 35
-        versionCode = 5
-        versionName = "1.2"
+        versionCode = 6
+        versionName = "1.2-moveos403"
 
         vectorDrawables.useSupportLibrary = true
 
         // GitHub repo that holds the public Releases used for update checks.
-        buildConfigField("String", "GIT_OWNER", "\"Asjohn720\"")
+        buildConfigField("String", "GIT_OWNER", "\"fayazmahammad281-ops\"")
         buildConfigField("String", "GIT_REPO", "\"ola-s1-mods\"")
     }
 
