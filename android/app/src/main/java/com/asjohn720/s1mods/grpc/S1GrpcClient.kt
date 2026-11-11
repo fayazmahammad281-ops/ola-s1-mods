@@ -17,8 +17,11 @@ import java.nio.charset.StandardCharsets
 import java.util.concurrent.TimeUnit
 
 /**
- * Direct gRPC client for MoveOS Root Diagnostics Service (TCP Port 50005).
- * Weakly-typed root execution without authentication or pairing.
+ * Direct gRPC client for the scooter diagnostics endpoint on TCP port 50005.
+ *
+ * IMPORTANT:
+ * connect() now only creates the channel. It deliberately does not execute
+ * ExecuteADBCommand, so GetSwVersion can be tested independently.
  */
 class S1GrpcClient(
     val host: String,
@@ -30,12 +33,14 @@ class S1GrpcClient(
     private fun descriptor(method: String): MethodDescriptor<ByteArray, ByteArray> =
         MethodDescriptor.newBuilder<ByteArray, ByteArray>()
             .setType(MethodDescriptor.MethodType.UNARY)
-            .setFullMethodName(MethodDescriptor.generateFullMethodName("wifican.WifiCanRpc", method))
+            .setFullMethodName(
+                MethodDescriptor.generateFullMethodName("wifican.WifiCanRpc", method)
+            )
             .setRequestMarshaller(ByteArrayMarshaller)
             .setResponseMarshaller(ByteArrayMarshaller)
             .build()
 
-    private val methodDescriptor = descriptor("ExecuteADBCommand")
+    private val executeAdbDescriptor = descriptor("ExecuteADBCommand")
 
     private object ByteArrayMarshaller : MethodDescriptor.Marshaller<ByteArray> {
         override fun stream(value: ByteArray): InputStream = ByteArrayInputStream(value)
@@ -43,76 +48,90 @@ class S1GrpcClient(
     }
 
     /**
-     * Resolves and normalizes the target host for OkHttpChannelBuilder.forAddress.
+     * Resolves the target host while preserving an IPv6 interface scope.
      */
     fun resolveTargetHost(): String {
-        var h = com.asjohn720.s1mods.discovery.NetworkScanner.normalizeHost(host)
+        var target = com.asjohn720.s1mods.discovery.NetworkScanner.normalizeHost(host)
 
-        // If fe80 link-local and missing scope, append scope if available
-        if (h.startsWith("fe80", ignoreCase = true) && !h.contains("%") && scope != null) {
-            h = "$h%$scope"
+        if (target.startsWith("fe80", ignoreCase = true) &&
+            !target.contains("%") &&
+            scope != null
+        ) {
+            target = "$target%$scope"
         }
 
         return try {
-            InetAddress.getByName(h).hostAddress ?: h
+            // Keep the scope identifier. It is required for link-local IPv6.
+            InetAddress.getByName(target).hostAddress ?: target
         } catch (_: Exception) {
-            h
+            target
         }
     }
 
     /**
-     * Connects and verifies channel responsiveness using OkHttpChannelBuilder.forAddress.
+     * Creates the plaintext gRPC channel only.
+     *
+     * No RPC is sent here. In particular, this does NOT call ExecuteADBCommand.
+     * This allows callers to test GetSwVersion separately.
      */
     suspend fun connect(timeoutSeconds: Long = 6L) = withContext(Dispatchers.IO) {
         val targetHost = resolveTargetHost()
         channel?.shutdownNow()
-        val ch = OkHttpChannelBuilder.forAddress(targetHost, port)
+        channel = OkHttpChannelBuilder.forAddress(targetHost, port)
             .usePlaintext()
             .maxInboundMessageSize(64 * 1024 * 1024)
             .build()
-        channel = ch
-
-        // Quick connectivity check using simple id -u
-        val (status, out) = executeRaw("id -u", timeoutSeconds)
-        if (status !in 0..1 && out.isEmpty()) {
-            throw IllegalStateException("No answer from scooter port $port at $targetHost")
-        }
     }
 
     /**
-     * Executes raw command string on the scooter's daemon.
+     * Executes the daemon's ExecuteADBCommand RPC.
      */
-    suspend fun executeRaw(command: String, timeoutSeconds: Long = 30L): Pair<Int, String> =
-        unary(methodDescriptor, ProtoUtils.buildCommandPayload(command), timeoutSeconds)
+    suspend fun executeRaw(
+        command: String,
+        timeoutSeconds: Long = 30L
+    ): Pair<Int, String> =
+        unary(
+            executeAdbDescriptor,
+            ProtoUtils.buildCommandPayload(command),
+            timeoutSeconds
+        )
 
     /**
-     * MoveOS software version via the daemon's dedicated GetSwVersion RPC
-     * (request is google.protobuf.Empty = empty bytes; response is the same
-     * status+message shape as ExecuteADBCommand). Returns the message string.
+     * Tests the separate GetSwVersion RPC using an empty request.
+     * Any gRPC error is allowed to propagate to the caller.
      */
-    suspend fun getSwVersion(timeoutSeconds: Long = 15L): String =
-        unary(descriptor("GetSwVersion"), ByteArray(0), timeoutSeconds).second
+    suspend fun getSwVersion(timeoutSeconds: Long = 15L): String {
+        val (_, message) = unary(descriptor("GetSwVersion"), ByteArray(0), timeoutSeconds)
+        return message
+    }
 
     private suspend fun unary(
         method: MethodDescriptor<ByteArray, ByteArray>,
         payload: ByteArray,
         timeoutSeconds: Long
     ): Pair<Int, String> = withContext(Dispatchers.IO) {
-        val ch = channel ?: throw IllegalStateException("Channel not connected")
+        val activeChannel = channel
+            ?: throw IllegalStateException("gRPC channel has not been created. Call connect() first.")
 
-        val call: ClientCall<ByteArray, ByteArray> = ch.newCall(
+        val call: ClientCall<ByteArray, ByteArray> = activeChannel.newCall(
             method,
             CallOptions.DEFAULT.withDeadlineAfter(timeoutSeconds, TimeUnit.SECONDS)
         )
 
         val resultHolder = CompletableResult<ByteArray>()
+
         call.start(object : ClientCall.Listener<ByteArray>() {
             override fun onMessage(message: ByteArray) {
                 resultHolder.complete(message)
             }
+
             override fun onClose(status: io.grpc.Status, trailers: io.grpc.Metadata) {
                 if (!status.isOk && !resultHolder.isDone()) {
                     resultHolder.completeExceptionally(status.asRuntimeException())
+                } else if (status.isOk && !resultHolder.isDone()) {
+                    resultHolder.completeExceptionally(
+                        IllegalStateException("gRPC completed without a response message")
+                    )
                 }
             }
         }, io.grpc.Metadata())
@@ -125,34 +144,44 @@ class S1GrpcClient(
     }
 
     /**
-     * Executes arbitrary shell commands. The command is base64-encoded and piped
-     * into sh, so spaces inside quotes and filenames survive the daemon's
-     * whitespace split (plain ${IFS} replacement broke `echo "a b"` and spaced paths).
+     * Executes arbitrary shell commands through the ADB command RPC.
      */
-    suspend fun shell(command: String, timeoutSeconds: Long = 30L): Pair<Int, String> {
-        val b64 = Base64.encodeToString(command.toByteArray(StandardCharsets.UTF_8), Base64.NO_WRAP)
-        val wrapped = "sh -c echo\${IFS}$b64|base64\${IFS}-d|sh"
+    suspend fun shell(
+        command: String,
+        timeoutSeconds: Long = 30L
+    ): Pair<Int, String> {
+        val encoded = Base64.encodeToString(
+            command.toByteArray(StandardCharsets.UTF_8),
+            Base64.NO_WRAP
+        )
+        val wrapped = "sh -c echo\${IFS}$encoded|base64\${IFS}-d|sh"
         return executeRaw(wrapped, timeoutSeconds)
     }
 
     /**
-     * Pushes binary data to remote file path on the scooter using base64 chunking.
+     * Pushes binary data to a remote file using base64 chunks.
      */
-    suspend fun push(data: ByteArray, remotePath: String, onProgress: (Float) -> Unit = {}): Boolean = withContext(Dispatchers.IO) {
+    suspend fun push(
+        data: ByteArray,
+        remotePath: String,
+        onProgress: (Float) -> Unit = {}
+    ): Boolean = withContext(Dispatchers.IO) {
         val encoded = Base64.encodeToString(data, Base64.NO_WRAP)
         val chunkSize = 50_000
         val totalChunks = (encoded.length + chunkSize - 1) / chunkSize
         var chunkIndex = 0
 
-        for (start in 0 until encoded.length step chunkSize) {
+        for (start in encoded.indices step chunkSize) {
             val end = (start + chunkSize).coerceAtMost(encoded.length)
             val part = encoded.substring(start, end)
             val redirect = if (start == 0) ">" else ">>"
-            val cmd = "sh -c echo\${IFS}$part|base64\${IFS}-d$redirect$remotePath"
-            val (status, msg) = executeRaw(cmd, 60L)
+            val command = "sh -c echo\${IFS}$part|base64\${IFS}-d$redirect$remotePath"
+            val (status, message) = executeRaw(command, 60L)
+
             if (status !in 0..1) {
-                throw IllegalStateException("Push failed at byte $start: $msg")
+                throw IllegalStateException("Push failed at character $start: $message")
             }
+
             chunkIndex++
             onProgress(chunkIndex.toFloat() / totalChunks.toFloat())
         }
@@ -160,44 +189,47 @@ class S1GrpcClient(
     }
 
     /**
-     * Pulls binary data from remote file path on the scooter using base64.
+     * Pulls a remote file using base64.
      */
-    suspend fun pull(remotePath: String, timeoutSeconds: Long = 120L): ByteArray = withContext(Dispatchers.IO) {
-        val (status, encoded) = shell("base64 $remotePath", timeoutSeconds)
-        if (status !in 0..1) {
-            throw IllegalStateException("Pull failed: $encoded")
+    suspend fun pull(remotePath: String, timeoutSeconds: Long = 120L): ByteArray =
+        withContext(Dispatchers.IO) {
+            val (status, encoded) = shell("base64 $remotePath", timeoutSeconds)
+            if (status !in 0..1) {
+                throw IllegalStateException("Pull failed: $encoded")
+            }
+            Base64.decode(encoded.trim(), Base64.DEFAULT)
         }
-        Base64.decode(encoded.trim(), Base64.DEFAULT)
-    }
 
     /**
      * Captures a screenshot from the scooter and returns it as a Bitmap.
      */
     suspend fun takeScreenshot(): Bitmap = withContext(Dispatchers.IO) {
-        val tmp = "/data/local/tmp/_dash_shot.png"
-        val (status, out) = executeRaw("screencap -p $tmp", 60L)
+        val tempPath = "/data/local/tmp/_dash_shot.png"
+        val (status, output) = executeRaw("screencap -p $tempPath", 60L)
+
         if (status !in 0..1) {
-            throw IllegalStateException("Screencap failed: $out")
+            throw IllegalStateException("Screencap failed: $output")
         }
-        val bytes = pull(tmp, 120L)
-        shell("rm -f $tmp", 20L)
+
+        val bytes = pull(tempPath, 120L)
+        shell("rm -f $tempPath", 20L)
+
         BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
             ?: throw IllegalStateException("Failed to decode screenshot bitmap")
     }
 
     /**
-     * Unlocks ADB by pushing the public key and bind-mounting it in RAM.
+     * Attempts the existing in-memory ADB key installation procedure.
      */
     suspend fun unlockAdb(adbPublicKeyContent: String): Boolean {
-        // 1. Upload public key to scooter
-        val keyBytes = adbPublicKeyContent.trim().plus("\n").toByteArray(StandardCharsets.UTF_8)
+        val keyBytes = adbPublicKeyContent.trim()
+            .plus("\n")
+            .toByteArray(StandardCharsets.UTF_8)
+
         push(keyBytes, "/data/local/tmp/adb_keys_mine")
         shell("chmod 644 /data/local/tmp/adb_keys_mine", 15L)
-
-        // 2. Set scootermode to serv
         shell("setprop persist.ola.security.scootermode serv", 15L)
 
-        // 3. Prepare and run bind mount script
         val bindScript = """#!/system/bin/sh
 if [ -f /data/misc/adb/adbkeymoveos3_pub_prod ]; then
     T=/data/misc/adb/adbkeymoveos3_pub_prod
@@ -213,14 +245,16 @@ echo "bound ${'$'}T"
 
         push(bindScript.toByteArray(StandardCharsets.UTF_8), "/data/local/tmp/bind_key.sh")
         shell("chmod 755 /data/local/tmp/bind_key.sh", 15L)
-        val (status, out) = shell("sh /data/local/tmp/bind_key.sh", 20L)
-        return (status in 0..1 && out.contains("bound"))
+        val (status, output) = shell("sh /data/local/tmp/bind_key.sh", 20L)
+
+        return status in 0..1 && output.contains("bound")
     }
 
     fun close() {
         try {
             channel?.shutdownNow()
-        } catch (_: Exception) {}
+        } catch (_: Exception) {
+        }
         channel = null
     }
 
@@ -232,15 +266,17 @@ echo "bound ${'$'}T"
 
         fun complete(value: T) {
             synchronized(lock) {
+                if (done) return
                 result = value
                 done = true
                 lock.notifyAll()
             }
         }
 
-        fun completeExceptionally(e: Throwable) {
+        fun completeExceptionally(error: Throwable) {
             synchronized(lock) {
-                exception = e
+                if (done) return
+                exception = error
                 done = true
                 lock.notifyAll()
             }
@@ -254,9 +290,8 @@ echo "bound ${'$'}T"
                     lock.wait()
                 }
                 exception?.let { throw it }
-                return result ?: throw IllegalStateException("Result is null")
+                return result ?: throw IllegalStateException("gRPC returned a null response")
             }
         }
     }
 }
-
