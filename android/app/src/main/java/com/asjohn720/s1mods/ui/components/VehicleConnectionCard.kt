@@ -181,16 +181,22 @@ fun VehicleConnectionCard(
                             onClick = {
                                 coroutineScope.launch {
                                     try {
+                                        // Only mark connected after the gRPC handshake succeeds.
                                         manager.connect(found.ip, found.scope)
-                                    } catch (_: Exception) {
-                                        manager.isConnected.value = true
+                                        if (manager.vehicleSummary.value == null && !isLoadingSummary) {
+                                            isLoadingSummary = true
+                                            try { manager.fetchVehicleSummary() } catch (_: Exception) {}
+                                            isLoadingSummary = false
+                                        }
+                                        Toast.makeText(context, "gRPC connected", Toast.LENGTH_SHORT).show()
+                                    } catch (e: Exception) {
+                                        manager.isConnected.value = false
+                                        Toast.makeText(
+                                            context,
+                                            "Scooter is reachable, but gRPC failed: ${e.localizedMessage ?: e.javaClass.simpleName}",
+                                            Toast.LENGTH_LONG
+                                        ).show()
                                     }
-                                    if (manager.vehicleSummary.value == null && !isLoadingSummary) {
-                                        isLoadingSummary = true
-                                        try { manager.fetchVehicleSummary() } catch (_: Exception) {}
-                                        isLoadingSummary = false
-                                    }
-                                    Toast.makeText(context, "Connected", Toast.LENGTH_SHORT).show()
                                 }
                             },
                             modifier = Modifier.fillMaxWidth().height(42.dp),
@@ -426,15 +432,25 @@ fun VehicleConnectionCard(
                             val open = manager.testConnection(finalIp, scopeFromPercent)
                             isTestingPort = false
                             if (open) {
-                                manager.isConnected.value = true
-                                Toast.makeText(context, "Connected", Toast.LENGTH_SHORT).show()
-                                // Show model + MoveOS for the manual path too.
-                                discoveredScooter = DiscoveredScooter(ip = finalIp, scope = scopeFromPercent)
-                                manager.vehicleSummary.value = null
-                                isLoadingSummary = true
-                                try { manager.fetchVehicleSummary() } catch (_: Exception) {}
-                                isLoadingSummary = false
+                                try {
+                                    // An open TCP port is reachability, not a successful gRPC connection.
+                                    manager.connect(finalIp, scopeFromPercent)
+                                    Toast.makeText(context, "gRPC connected", Toast.LENGTH_SHORT).show()
+                                    discoveredScooter = DiscoveredScooter(ip = finalIp, scope = scopeFromPercent)
+                                    manager.vehicleSummary.value = null
+                                    isLoadingSummary = true
+                                    try { manager.fetchVehicleSummary() } catch (_: Exception) {}
+                                    isLoadingSummary = false
+                                } catch (e: Exception) {
+                                    manager.isConnected.value = false
+                                    Toast.makeText(
+                                        context,
+                                        "Port is reachable, but gRPC failed: ${e.localizedMessage ?: e.javaClass.simpleName}",
+                                        Toast.LENGTH_LONG
+                                    ).show()
+                                }
                             } else {
+                                manager.isConnected.value = false
                                 Toast.makeText(context, "Saved, but not reachable yet", Toast.LENGTH_SHORT).show()
                             }
                         }
