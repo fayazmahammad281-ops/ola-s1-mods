@@ -71,7 +71,8 @@ data class RamInfo(
 
 /**
  * Minimal vehicle identity shown on the connect/setup card.
- * supported = MoveOS major version >= 5 (1-4 are not supported; mods may not work).
+ * The advertised minimum supported firmware is MoveOS 4.0.3.
+ * This is a compatibility indicator, not proof that every RPC/mod works on every build.
  */
 data class VehicleSummary(
     val model: String,
@@ -550,13 +551,31 @@ class ScooterManager(private val context: Context) {
             firstLine.startsWith("MoveOS", ignoreCase = true) -> firstLine
             else -> "MoveOS $firstLine"
         }
-        val major = Regex("""(\d+)""").find(firstLine)?.groupValues?.get(1)?.toIntOrNull()
+        val versionMatch = Regex("""(\d+)\.(\d+)\.(\d+)""").find(firstLine)
+        val versionParts = versionMatch?.groupValues?.drop(1)?.mapNotNull { it.toIntOrNull() }
+        val major = versionParts?.firstOrNull()
+            ?: Regex("""(\d+)""").find(firstLine)?.groupValues?.get(1)?.toIntOrNull()
+        val supported = isMoveOsVersionSupported(versionParts, major)
 
         val model = fetchModelName(client)
-        log("[+] $model, $moveOs")
-        val result = VehicleSummary(model, moveOs, major, major != null && major >= 5)
+        log("[+] $model, $moveOs (supported=$supported)")
+        val result = VehicleSummary(model, moveOs, major, supported)
         vehicleSummary.value = result
         result
+    }
+
+    /**
+     * Accept MoveOS 4.0.3 and newer. Major-only 5.x+ responses remain accepted
+     * for daemons that do not return a full semantic version string.
+     */
+    private fun isMoveOsVersionSupported(parts: List<Int>?, major: Int?): Boolean {
+        if (parts != null && parts.size == 3) {
+            val (versionMajor, versionMinor, versionPatch) = parts
+            return versionMajor > 4 ||
+                (versionMajor == 4 && (versionMinor > 0 ||
+                    (versionMinor == 0 && versionPatch >= 3)))
+        }
+        return major != null && major >= 5
     }
 
     private suspend fun fetchModelName(client: S1GrpcClient): String {
